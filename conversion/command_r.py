@@ -122,6 +122,15 @@ class Cohere2MoeModel(TextModel):
         else:
             self.n_layer_dense_lead = self.hparams["first_k_dense_replace"]
 
+        if self.hparams.get("num_shared_experts", 0) > 0:
+            strategy = self.hparams.get("shared_expert_combination_strategy", "average")
+            if strategy == "average":
+                self._shexp_scale = 0.5
+            elif strategy == "sum":
+                self._shexp_scale = 1.0
+            else:
+                raise ValueError(f"Unknown shared_expert_combination_strategy {strategy!r}")
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
@@ -137,9 +146,23 @@ class Cohere2MoeModel(TextModel):
         self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
         self.gguf_writer.add_expert_weights_norm(self.hparams["norm_topk_prob"])
 
+        # the shared expert branch is a single MLP of width intermediate_size *
+        # num_shared_experts; "average" combines as (routed + shared) / 2, which
+        # maps onto existing mechanics as expert_weights_scale = 0.5 on the
+        # routed weights and 0.5 folded into the shared down_proj
+        if (n_shexp := self.hparams.get("num_shared_experts", 0)) > 0:
+            if self._shexp_scale != 1.0:
+                self.gguf_writer.add_expert_weights_scale(self._shexp_scale)
+            self.gguf_writer.add_expert_shared_count(n_shexp)
+            self.gguf_writer.add_expert_shared_feed_forward_length(self.n_ff_exp * n_shexp)
+
     _experts: list[dict[str, Tensor]] | None = None
+    _shexp_scale: float = 1.0
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith("mlp.shared_experts.down_proj.weight") and self._shexp_scale != 1.0:
+            data_torch = data_torch * self._shexp_scale
+
         if name.find("mlp.experts") != -1:
             n_experts = self.hparams["num_experts"]
             assert bid is not None
